@@ -1,8 +1,12 @@
-#include <coroutine>
-#include <iostream>
-#include <optional>
-#include <mutex>
 #include <condition_variable>
+#include <coroutine>
+#include <functional>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+#include <unordered_map>
 
 // ----------------------------------------------------------------------------
 
@@ -18,30 +22,32 @@ struct track
 
 // ----------------------------------------------------------------------------
 
+struct none {};
+
+template <typename X>
+struct promise_type_base
+{
+    template <typename R>
+    void return_value(R&& r) { result.emplace(std::forward<R>(r)); }
+    std::optional<X> result;
+};
+
+template <>
+struct promise_type_base<void>
+{
+    void return_void() {}
+    std::optional<none> result;
+};
+
+// ----------------------------------------------------------------------------
+
 template <typename T = void>
 struct task
 {
     using type = T;
-
-    struct none {};
     using aux = std::conditional_t<std::is_same_v<T, void>, none, T>;
-    template <typename X>
-    struct promise_type_base
-    {
-        template <typename R>
-        void return_value(R&& r) { result.emplace(std::forward<R>(r)); }
-        std::optional<aux> result;
-    };
-    template <>
-    struct promise_type_base<void>
-    {
-        void return_void() {}
-        std::optional<aux> result;
-    };
-
     struct promise_type
-        : track<decltype([]()->char const*{ return "task"; })>
-        , promise_type_base<T>
+        : promise_type_base<T>
     {
         struct final_awaiter
         {
@@ -66,14 +72,12 @@ struct task
     {
         this->handle.promise().handle = outer;
         this->result = &this->handle.promise().result;
-        std::cout << "promise=" << &this->handle.promise().msg << " result-addr=" << this->result << "\n";
         return std::move(this->handle);
     }
     T await_resume()
     {
         if constexpr (not std::same_as<T, void>)
         {
-            std::cout << "await_resume: addr=" << this->result << "\n";
             return **this->result;
         }
     }
@@ -90,26 +94,10 @@ struct task
 template <typename T>
 struct starter
 {
-    struct none {};
     using aux = std::conditional_t<std::is_same_v<T, void>, none, T>;
 
-    template <typename R>
-    struct promise_type_base
-    {
-        std::optional<aux> result;
-        template <typename X>
-        void return_value(X&& x) { result.emplace(std::forward<X>(x)); }
-    };
-    template <>
-    struct promise_type_base<void>
-    {
-        std::optional<aux> result;
-        void return_void() { result.emplace(none{}); }
-    };
-
     struct promise_type
-        : track<decltype([]()->char const*{ return "starter"; })>
-        , promise_type_base<T>
+        : promise_type_base<T>
     {
         struct final_awaiter
         {
@@ -155,6 +143,92 @@ typename Task::type coroutine_wait(Task task)
 
 // ----------------------------------------------------------------------------
 
+struct coroutine_scope
+{
+    struct work
+    {
+        struct promise_type
+        {
+            std::suspend_never initial_suspend() const noexcept { return {}; }
+            std::suspend_never final_suspend() const noexcept { return {}; }
+            void unhandled_exception() { std::terminate(); }
+            work get_return_object() { return {}; }
+        };
+    };
+
+    std::atomic<std::size_t> count{};
+    std::function<void()>    on_empty{[]{}};
+
+    template <typename Task>
+    void spawn(Task&& task)
+    {
+        ++this->count;
+        std::invoke(
+            [](Task task, auto& scope)->work{
+                co_await task;
+                if (0u == --scope.count)
+                {
+                    scope.on_empty();
+                }
+            },
+            std::forward<Task>(task),
+            *this
+        );
+    }
+    template <typename Fun>
+    void when_empty(Fun&& fun)
+    {
+        this->on_empty = std::forward<Fun>(fun);
+    }
+};
+
+// ----------------------------------------------------------------------------
+
+struct context
+{
+    struct outstanding_request
+    {
+        std::coroutine_handle<> handle;
+        std::optional<std::string> result;
+    };
+    std::unordered_map<int, outstanding_request> work;
+
+    struct awaiter
+    {
+        std::unordered_map<int, outstanding_request>*          work;
+        std::unordered_map<int, outstanding_request>::iterator request;
+
+        bool await_ready() const noexcept { return this->request->second.result.has_value(); }
+        void await_suspend(std::coroutine_handle<> handle)
+        {
+            this->request->second.handle = handle;
+        }
+        std::string await_resume()
+        {
+            std::string rc(std::move(*this->request->second.result));
+            this->work->erase(this->request);
+            return rc;
+        }
+    };
+
+    bool empty() const { return this->work.empty(); }
+    awaiter request(int id)
+    {
+        return { &this->work, this->work.insert(std::pair(id, outstanding_request{})).first };
+    }
+    void complete(int id, std::string value)
+    {
+        auto& outstanding{this->work[id]};
+        outstanding.result.emplace(std::move(value));
+        if (outstanding.handle)
+        {
+            outstanding.handle.resume();
+        }
+    }
+};
+
+// ----------------------------------------------------------------------------
+
 task<int> make_work()
 {
     std::cout << "make work 1\n";
@@ -171,4 +245,35 @@ int main()
     auto t = make_work();
     auto res = coroutine_wait(std::move(t));
     std::cout << "coroutine result=" << res << "\n";
+    std::cout << "\n";
+
+    context         ctxt;
+    coroutine_scope scope;
+    scope.when_empty([&ctxt]{
+            std::cout << "scope is done: ctxt.empty()==" << std::boolalpha << ctxt.empty() << "\n";
+        });
+    scope.spawn(std::invoke([](context& ctxt)->task<>{
+            auto res1{co_await ctxt.request(1)};
+            std::cout << "task 1 res1=" << res1 << "\n";
+            auto res2{co_await ctxt.request(2)};
+            std::cout << "task 1 res2=" << res2 << "\n";
+        },
+        ctxt));
+    scope.spawn(std::invoke([](context& ctxt)->task<>{
+            auto res1{co_await ctxt.request(3)};
+            std::cout << "task 2 res1=" << res1 << "\n";
+            auto res2{co_await ctxt.request(4)};
+            std::cout << "task 2 res2=" << res2 << "\n";
+        },
+        ctxt));
+    std::pair<int, std::string> results[]{
+        { 3, "value 3" },
+        { 2, "value 2" },
+        { 1, "value 1" },
+        { 4, "value 4" }
+    };
+    for (auto[id, value]: results)
+    {
+        ctxt.complete(id, value);
+    }
 }
